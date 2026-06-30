@@ -1,63 +1,89 @@
 import { NextResponse } from 'next/server';
+import { z } from 'zod';
 import { readAll, writeAll } from '../../../lib/store';
 
-// FLAW #1: Hardcoded secret committed to source — admin key used for... nothing, really
-const ADMIN_KEY = 'sk-admin-12345'; // admin key
+const feedbackSchema = z.object({
+  name: z.string().trim().min(1, 'Name is required').max(100, 'Name must be 100 characters or less'),
+  text: z.string().trim().min(1, 'Feedback is required').max(2000, 'Feedback must be 2000 characters or less'),
+});
 
-// formatRelativeTime is imported from our date utils
-// FLAW #6 (hallucination artifact): This helper was referenced in AI-generated code but
-// never actually defined or imported. Guarded with typeof check so the app still runs.
-// The call below always falls through to the raw value because the function doesn't exist.
+function getAdminKey() {
+  const adminKey = process.env.ADMIN_KEY;
+
+  if (!adminKey) {
+    throw new Error('ADMIN_KEY environment variable is required');
+  }
+
+  return adminKey;
+}
+
+function getBearerToken(request) {
+  const header = request.headers.get('authorization') || '';
+  const [scheme, token] = header.split(' ');
+
+  return scheme?.toLowerCase() === 'bearer' ? token : null;
+}
 
 export async function GET() {
   const items = readAll();
-  const formatted = items.map((item) => ({
-    ...item,
-    // from our date utils
-    displayTime: typeof formatRelativeTime === 'function'
-      ? formatRelativeTime(item.createdAt)
-      : item.createdAt,
-  }));
-  return NextResponse.json(formatted);
+
+  return NextResponse.json(items);
 }
 
 export async function POST(request) {
-  const body = await request.json();
-  const items = readAll();
-
-  // FLAW #2: No input validation — name/text not checked for type, length, or content
-  const newItem = {
-    id: Date.now().toString(),
-    name: body.name,
-    text: body.text,
-    createdAt: new Date().toISOString(),
-  };
-
-  items.push(newItem);
-
-  // FLAW #5: Silent failure — if the write fails, the error is swallowed entirely
   try {
-    writeAll(items);
-  } catch (e) {}
+    const body = await request.json();
+    const result = feedbackSchema.safeParse(body);
 
-  return NextResponse.json(newItem, { status: 201 });
+    if (!result.success) {
+      return NextResponse.json(
+        { error: 'Invalid feedback', issues: result.error.flatten().fieldErrors },
+        { status: 400 }
+      );
+    }
+
+    const items = readAll();
+    const newItem = {
+      id: Date.now().toString(),
+      ...result.data,
+      createdAt: new Date().toISOString(),
+    };
+
+    items.push(newItem);
+    writeAll(items);
+
+    return NextResponse.json(newItem, { status: 201 });
+  } catch (error) {
+    console.error('Failed to save feedback:', error);
+
+    return NextResponse.json({ error: 'Failed to save feedback' }, { status: 500 });
+  }
 }
 
 export async function DELETE(request) {
-  const body = await request.json();
-
-  // FLAW #4: Trusts isAdmin from the client body — no real authentication
-  if (!body.isAdmin) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
-  }
-
-  const items = readAll();
-  const updated = items.filter((item) => item.id !== body.id);
-
-  // FLAW #5: Same silent failure pattern on delete write
   try {
-    writeAll(updated);
-  } catch (e) {}
+    const adminKey = getAdminKey();
+    const token = getBearerToken(request);
 
-  return NextResponse.json({ success: true });
+    if (token !== adminKey) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    const body = await request.json();
+
+    if (!body.id || typeof body.id !== 'string') {
+      return NextResponse.json({ error: 'Feedback id is required' }, { status: 400 });
+    }
+
+    const items = readAll();
+    const updated = items.filter((item) => item.id !== body.id);
+
+    writeAll(updated);
+
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    console.error('Failed to delete feedback:', error);
+
+    return NextResponse.json({ error: 'Failed to delete feedback' }, { status: 500 });
+  }
 }
